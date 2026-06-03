@@ -59,7 +59,7 @@ LOG_ACTIVE = False
 BUNNY_STORAGE_URL = "https://storage.bunnycdn.com/datalg"
 BUNNY_API_KEY = "20e09264-6a0b-4c15-9500eb86adfd-cfc3-482e"
 
-DNS_WORKERS_EC2 = 100
+DNS_WORKERS_EC2 = 10
 DNS_TIMEOUT_EC2 = 3
 MAX_IPS_PER_CIDR = 5
 
