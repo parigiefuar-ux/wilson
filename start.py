@@ -130,7 +130,7 @@ def _aws_sigv4_headers(bucket, key, payload, content_type="application/octet-str
         "Content-Type": content_type,
     }
 
-DNS_WORKERS_EC2 = 100
+DNS_WORKERS_EC2 = 25
 DNS_TIMEOUT_EC2 = 3
 MAX_IPS_PER_CIDR = 5
 
@@ -418,7 +418,7 @@ def process_urls(urls_list, is_fallback=False):
                         }
                 if r: r.close()
 
-            site_pool = Pool(50)
+            site_pool = Pool(15)
             jobs = []
             for site_link, site_payloads in hosts_by_site.items():
                 print(f"  [SCANNER] 🎯 Analisi target attivo: {site_link}", flush=True)
