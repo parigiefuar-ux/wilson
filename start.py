@@ -569,12 +569,15 @@ def gather_and_scan_cycle(cidr_pool, worker_id, num_workers, cycle_num):
             continue
 
         offsets_pool = list(range(rem, total, TOTAL_SLOTS))
-        rng = random.Random(first * 7919 + cycle_num * 104729)
+        rng = random.Random(first * 7919)
+        rng.shuffle(offsets_pool)
+
         n_take = min(len(offsets_pool), MAX_IPS_PER_CIDR)
-        if n_take >= len(offsets_pool):
-            chosen = offsets_pool
-        else:
-            chosen = rng.sample(offsets_pool, n_take)
+        start = (cycle_num - 1) * MAX_IPS_PER_CIDR
+        if start >= len(offsets_pool):
+            continue
+        end = min(start + n_take, len(offsets_pool))
+        chosen = offsets_pool[start:end]
 
         for off in chosen:
             all_ips.append((str(ipaddress.ip_address(first + off)), region))
