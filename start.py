@@ -57,11 +57,11 @@ LOG_UPLOAD_INTERVAL = random.randint(500, 800)
 LOG_ACTIVE = False
 
 # S3 CONFIG — bucket dedicato per i risultati DIABLO
-S3_BUCKET = "q-pass-public"
+S3_BUCKET = "diablo-results-store"
 S3_FOLDER = "diablo-results"
 S3_REGION = "eu-north-1"
-S3_ACCESS_KEY = "AKIA6FGTUF5CY6A4MIXK"
-S3_SECRET_KEY = "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"
+S3_ACCESS_KEY = "AKIAW3MEAPS545FBGS5I"
+S3_SECRET_KEY = "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"
 S3_HOST = f"s3.{S3_REGION}.amazonaws.com"
 
 import hashlib
@@ -141,6 +141,89 @@ _CONTAINER_NAME = os.environ.get('HOSTNAME', f'local_{int(time.time())}')
 _SLOT_HASH = int(hashlib.md5(_CONTAINER_NAME.encode()).hexdigest()[:12], 16)
 INSTANCE_ID = _SLOT_HASH % TOTAL_SLOTS
 
+def _append_to_s3_index(s3_key_full):
+    """Registra il file nell'index.txt su S3 con retry e locking ottimistico (ETag).
+    Resiste a race condition tra 40+ VPS che scrivono simultaneamente."""
+    index_key = f"{S3_FOLDER}/index.txt"
+    url_idx = f"https://{S3_BUCKET}.{S3_HOST}/{index_key}"
+
+    for attempt in range(5):
+        try:
+            # Jitter random per ridurre collisioni tra VPS
+            time.sleep(random.uniform(0.5, 3.0))
+
+            # --- GET con Signature V4 ---
+            amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            date_stamp = amz_date[:8]
+
+            canonical_headers_get = (
+                f"host:{S3_BUCKET}.{S3_HOST}\n"
+                f"x-amz-content-sha256:UNSIGNED-PAYLOAD\n"
+                f"x-amz-date:{amz_date}\n"
+            )
+            signed_headers_get = "host;x-amz-content-sha256;x-amz-date"
+            canonical_request_get = (
+                f"GET\n/{index_key}\n\n{canonical_headers_get}\n{signed_headers_get}\nUNSIGNED-PAYLOAD"
+            )
+            credential_scope = f"{date_stamp}/{S3_REGION}/s3/aws4_request"
+            string_to_sign_get = (
+                f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n"
+                f"{hashlib.sha256(canonical_request_get.encode('utf-8')).hexdigest()}"
+            )
+            k_date = _aws_sign(("AWS4" + S3_SECRET_KEY).encode("utf-8"), date_stamp)
+            k_region = _aws_sign(k_date, S3_REGION)
+            k_service = _aws_sign(k_region, "s3")
+            k_signing = _aws_sign(k_service, "aws4_request")
+            sig_get = hmac.new(k_signing, string_to_sign_get.encode("utf-8"), hashlib.sha256).hexdigest()
+
+            get_headers = {
+                "Host": f"{S3_BUCKET}.{S3_HOST}",
+                "x-amz-date": amz_date,
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+                "Authorization": f"AWS4-HMAC-SHA256 Credential={S3_ACCESS_KEY}/{credential_scope}, "
+                                 f"SignedHeaders={signed_headers_get}, Signature={sig_get}",
+            }
+
+            res_get = requests.get(url_idx, headers=get_headers, timeout=10)
+            existing = ""
+            current_etag = None
+
+            if res_get.status_code == 200:
+                existing = res_get.text or ""
+                current_etag = res_get.headers.get("ETag", "").strip('"')
+            # 404 -> index non esiste ancora, ok
+
+            # Appende
+            new_content = existing + s3_key_full + "\n"
+            idx_payload = new_content.encode("utf-8")
+
+            # --- PUT con If-Match (locking ottimistico) ---
+            put_headers = _aws_sigv4_headers(S3_BUCKET, index_key, idx_payload, content_type="text/plain")
+            if current_etag:
+                put_headers["If-Match"] = f'"{current_etag}"'
+
+            res_put = requests.put(url_idx, headers=put_headers, data=idx_payload, timeout=10)
+
+            if res_put.status_code in [200, 201]:
+                return  # OK
+            elif res_put.status_code == 412:  # Precondition Failed -> ETag mismatch
+                # Un'altra VPS ha modificato l'index, retry
+                backoff = 0.5 * (2 ** attempt)
+                time.sleep(backoff)
+                continue
+            else:
+                # Errore inatteso, retry
+                time.sleep(1)
+                continue
+
+        except Exception:
+            time.sleep(1)
+            continue
+
+    # Dopo 5 tentativi, l'index potrebbe aver perso questa entry.
+    # I file sono comunque su S3; il prossimo deploy li recupera.
+    pass
+
 def upload_file_to_s3(local_path, remote_path, max_retries=3):
     """Carica un file su S3 nella cartella dedicata diablo-results — via HTTP PUT + AWS SigV4 (no boto3)."""
     s3_key = f"{S3_FOLDER}/{remote_path}"
@@ -157,6 +240,8 @@ def upload_file_to_s3(local_path, remote_path, max_retries=3):
 
             if res.status_code in [200, 201]:
                 print(f"[S3 UPLOAD] OK Caricato su S3: s3://{S3_BUCKET}/{s3_key}", flush=True)
+                # Registra nel index per download futuro
+                _append_to_s3_index(s3_key)
                 return True
             elif res.status_code == 429:
                 wait = 2 ** attempt
